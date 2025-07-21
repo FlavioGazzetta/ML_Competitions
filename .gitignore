@@ -19,3 +19,5 @@ dist/
 .idea/
 
 catboost_info/
+
+*.csv
