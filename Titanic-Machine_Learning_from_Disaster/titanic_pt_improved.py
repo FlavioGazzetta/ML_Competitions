@@ -10,12 +10,14 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import TensorDataset, DataLoader
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Manager
+from tqdm import trange
 
 # Argument parsing for compute device
 def parse_args():
     parser = argparse.ArgumentParser(description='Titanic PyTorch Training')
-    parser.add_argument('--device', type=str, choices=['cpu', 'cuda'], default=None, help='Compute device to use (cpu or cuda)')
+    parser.add_argument('--device', type=str, choices=['cpu', 'cuda'], default=None,
+                        help='Compute device to use (cpu or cuda)')
     return parser.parse_args()
 
 args = parse_args()
@@ -37,7 +39,7 @@ if device.type == 'cuda':
     for i in range(torch.cuda.device_count()):
         print(f"  [{i}] {torch.cuda.get_device_name(i)}")
 
-# Train/eval loops
+# Training and evaluation loops
 def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -113,49 +115,64 @@ def make_model(input_dim):
     )
 
 # Single experiment runner
-def run_experiment(epochs, ct, dim, cat_feats, num_feats, q=None):
+def run_experiment(epochs, ct, dim, cat_feats, num_feats, global_best, lock, q=None):
     print(f"[Start] Exp {epochs} on {device}")
     df_tr = preprocess(pd.read_csv('train.csv'))
     X = ct.transform(df_tr)
     if hasattr(X, 'toarray'):
         X = X.toarray()
     y = df_tr['Survived'].values
-    X_t, X_v, y_t, y_v = train_test_split(X, y, test_size=0.2,stratify=y, random_state=42)
-    lt = DataLoader(TensorDataset(torch.tensor(X_t, dtype=torch.float32),torch.tensor(y_t, dtype=torch.float32)),batch_size=64, shuffle=True)
-    lv = DataLoader(TensorDataset(torch.tensor(X_v, dtype=torch.float32),torch.tensor(y_v, dtype=torch.float32)),batch_size=64)
+    X_t, X_v, y_t, y_v = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    lt = DataLoader(TensorDataset(
+                  torch.tensor(X_t, dtype=torch.float32),
+                  torch.tensor(y_t, dtype=torch.float32)),
+                  batch_size=64, shuffle=True)
+    lv = DataLoader(TensorDataset(
+                  torch.tensor(X_v, dtype=torch.float32),
+                  torch.tensor(y_v, dtype=torch.float32)),
+                  batch_size=64)
     model = make_model(dim).to(device)
     opt = optim.Adam(model.parameters(), lr=1e-3)
-    sched = ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=50)
+    sched = ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=10000)
     crit = nn.BCELoss()
-    best_acc, stagn = 0.0, 0
-    for e in range(1, epochs+1):
+    best_acc_local, stagn = 0.0, 0
+    for e in trange(1, epochs+1, desc=f"Exp {epochs}", leave=False):
         tr_loss = train_epoch(model, lt, crit, opt, device)
         vl_loss, vl_acc = eval_epoch(model, lv, crit, device)
         sched.step(vl_acc)
-        print(f"[Exp {epochs}] Epoch {e}: tr_loss={tr_loss:.4f}, vl_acc={vl_acc:.4f}")
-        if vl_acc > best_acc:
-            best_acc, stagn = vl_acc, 0
-            torch.save(model.state_dict(), f'best_{epochs}.pth')
-            print(f"  New best val_acc: {best_acc:.4f} at epoch {e}")
+        if vl_acc > best_acc_local:
+            best_acc_local, stagn = vl_acc, 0
+            torch.save(model.state_dict(), 'best_model.pth')
+            with lock:
+                if vl_acc > global_best.value:
+                    global_best.value = vl_acc
+                    print(f"[Global New Best] Exp {epochs} epoch {e}: tr_loss={tr_loss:.4f}, vl_loss={vl_loss:.4f}, vl_acc={vl_acc:.4f}")
         else:
             stagn += 1
-        if stagn >= 2000:
-            print(f"[Exp {epochs}] Early stop at epoch {e}")
+        if stagn >= 5000:
+            print(f"[Exp {epochs}] Early stop at epoch {e} (no improvement for {stagn} iters)")
             break
     if q:
-        q.put((epochs, best_acc))
+        q.put((epochs, best_acc_local))
 
 # Main execution
 if __name__ == '__main__':
     df0 = preprocess(pd.read_csv('train.csv'))
-    cat_feats = ['Pclass','Sex','AgeBin','FareBin','FamilySize','Title','Deck', 'TicketPrefix','Embarked','Pclass_Sex','Age_Fare']
+    cat_feats = ['Pclass','Sex','AgeBin','FareBin','FamilySize','Title','Deck',
+                 'TicketPrefix','Embarked','Pclass_Sex','Age_Fare']
     num_feats = ['FamilySize','Age','Fare','Pclass_Sex','Age_Fare']
     ct, dim = build_preprocessor(df0, cat_feats, num_feats)
-    exps = [2000, 2000, 2000]
+
+    manager = Manager()
+    global_best = manager.Value('f', 0.0)
+    lock = manager.Lock()
+
+    exps = [10000] * 1
     q = Queue()
     procs = []
     for ex in exps:
-        p = Process(target=run_experiment, args=(ex, ct, dim, cat_feats, num_feats, q))
+        p = Process(target=run_experiment,
+                    args=(ex, ct, dim, cat_feats, num_feats, global_best, lock, q))
         p.start()
         procs.append(p)
     results = [q.get() for _ in exps]
@@ -170,7 +187,7 @@ if __name__ == '__main__':
     if hasattr(Xte, 'toarray'):
         Xte = Xte.toarray()
     model = make_model(dim).to(device)
-    model.load_state_dict(torch.load(f'best_{best_epochs}.pth', map_location=device))
+    model.load_state_dict(torch.load('best_model.pth', map_location=device))
     model.eval()
     with torch.no_grad():
         preds = (model(torch.tensor(Xte, dtype=torch.float32).to(device))
@@ -186,9 +203,6 @@ if __name__ == '__main__':
     path = os.path.join(out_dir, fname)
     submission.to_csv(path, index=False)
     print(f"Submission saved to {path}")
-    # cleanup
-    for ex in exps:
-        ck = f'best_{ex}.pth'
-        if os.path.exists(ck):
-            os.remove(ck)
-            print(f"Removed checkpoint {ck}")
+    if os.path.exists('best_model.pth'):
+        os.remove('best_model.pth')
+        print("Removed checkpoint best_model.pth")
