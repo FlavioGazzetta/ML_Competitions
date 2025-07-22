@@ -1,45 +1,44 @@
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from PIL import Image
-import torch
+from clip_checker import check_frame_for_health_issue
+import cv2
 
-# Load model/tokenizer
-@st.cache_resource
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained("model/local_tokenizer")
-    model = AutoModelForCausalLM.from_pretrained("model/local_model", device_map="auto")
-    return tokenizer, model
+st.set_page_config(page_title="Pocket Doc", layout="centered", initial_sidebar_state="collapsed")
 
-tokenizer, model = load_model()
+st.title("Pocket Doc: AI Triage Assistant")
 
-st.title("🩺 Pocket Doc – Offline Medical Triage Assistant")
+if st.button("Start Webcam"):
+    cap = cv2.VideoCapture(0)
+    stframe = st.empty()
+    alert_box = st.empty()
+    stop_button = st.button("Stop Webcam")
 
-st.markdown("Describe your symptoms and (optionally) upload a photo.")
+    frame_count = 0
+    process_every = 5
 
-# Text input for symptoms
-symptoms = st.text_area("What symptoms are you experiencing?", height=150)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Could not read from webcam.")
+            break
 
-# Image input
-image = st.file_uploader("Upload an image (rash, wound, etc.)", type=["jpg", "jpeg", "png"])
-image_path = None
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        small_frame = cv2.resize(frame_rgb, (224, 224), interpolation=cv2.INTER_AREA)
 
-if image:
-    image_path = f"images/uploaded_{image.name}"
-    with open(image_path, "wb") as f:
-        f.write(image.getbuffer())
-    st.image(Image.open(image), caption="Uploaded image", use_column_width=True)
+        matches = []
+        if frame_count % process_every == 0:
+            matches = check_frame_for_health_issue(small_frame)
+        frame_count += 1
 
-if st.button("Analyze"):
-    with st.spinner("Analyzing..."):
-        prompt = f"""You are a medical triage assistant.
-The patient says: "{symptoms}"
+        stframe.image(frame_rgb, channels="RGB", use_container_width=True, clamp=True)
 
-{f'A photo of the condition has been provided.' if image else 'No image was uploaded.'}
+        if matches:
+            alert_box.warning("⚠️ Possible issues detected:")
+            issues = "\n".join([f"- **{desc}** ({prob*100:.1f}%)" for desc, prob in matches])
+            alert_box.markdown(issues)
+        else:
+            alert_box.info("✅ No visible health issues detected.")
 
-Please assess the severity and give a recommendation. Respond clearly and calmly, and mention whether to self-manage, consult a doctor, or seek urgent care.
-"""
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        outputs = model.generate(**inputs, max_new_tokens=250)
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        st.markdown("### 🧠 Assessment")
-        st.write(response)
+        if stop_button:
+            break
+
+    cap.release()

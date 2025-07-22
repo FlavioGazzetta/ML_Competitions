@@ -3,6 +3,7 @@ venv/
 gemma-env/
 local_model/
 local_tokenizer/
+model/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

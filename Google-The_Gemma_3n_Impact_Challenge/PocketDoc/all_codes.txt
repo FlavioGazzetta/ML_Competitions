@@ -1,0 +1,125 @@
+=============== ./app.py ===============
+import streamlit as st
+from clip_checker import check_frame_for_health_issue
+import cv2
+
+def show_webcam_stream():
+    cap = cv2.VideoCapture(0)
+    stframe = st.empty()
+    alert_box = st.empty()
+
+    stop_button = st.button("Stop Webcam")
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Could not read from webcam.")
+            break
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        matches = check_frame_for_health_issue(frame_rgb)
+        stframe.image(frame_rgb, channels="RGB", use_container_width=True)
+
+        if matches:
+            with alert_box:
+                st.warning("⚠️ Possible issues detected:")
+                for desc, prob in matches:
+                    st.write(f"• **{desc}** ({prob*100:.1f}%)")
+        else:
+            alert_box.info("✅ No visible health issues detected.")
+
+        if stop_button:
+            break
+
+    cap.release()
+
+# === Entry point for the app ===
+st.title("Pocket Doc: AI Triage Assistant")
+if st.button("Start Webcam"):
+    show_webcam_stream()
+
+
+
+=============== ./clip_checker.py ===============
+# clip_checker.py
+
+import torch
+import clip
+from PIL import Image
+import numpy as np
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess = clip.load("ViT-B/32", device=device)
+
+# You can customize or extend this list
+HEALTH_TERMS = ["a wound", "a rash", "a bruise", "swelling", "infection"]
+
+def check_frame_for_health_issue(frame: np.ndarray, threshold=0.25):
+    image = Image.fromarray(frame)
+    image_input = preprocess(image).unsqueeze(0).to(device)
+
+    text_inputs = torch.cat([clip.tokenize(f"This image shows {desc}") for desc in HEALTH_TERMS]).to(device)
+
+    with torch.no_grad():
+        image_features = model.encode_image(image_input)
+        text_features = model.encode_text(text_inputs)
+
+        logits_per_image, _ = model(image_input, text_inputs)
+        probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
+
+    # Return description + probability if above threshold
+    matches = [(desc, prob) for desc, prob in zip(HEALTH_TERMS, probs) if prob > threshold]
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return matches
+
+
+
+=============== ./vision_analysis.py ===============
+
+
+
+=============== ./webcam.py ===============
+import cv2
+import streamlit as st
+
+def capture_frame():
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+
+    if not ret:
+        st.error("❌ Could not capture frame from webcam.")
+        return None
+
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    cap.release()
+    return frame
+
+
+
+=============== ./webcam_stream.py ===============
+import cv2
+import streamlit as st
+
+def show_webcam_stream():
+    cap = cv2.VideoCapture(0)
+
+    stframe = st.empty()
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("❌ Failed to read from webcam.")
+            break
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # ✅ Updated to avoid deprecation warning
+        stframe.image(frame, channels="RGB", use_container_width=True)
+
+        if st.session_state.get("stop_webcam", False):
+            break
+
+    cap.release()
+
+
+
